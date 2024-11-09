@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Medical Intake Assistant</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.js"></script>
+</head>
+<body class="bg-gray-100 min-h-screen flex items-center justify-center">
+    <div class="max-w-md w-full mx-4">
+        <div class="bg-white rounded-lg shadow-xl p-8">
+            <div class="text-center mb-8">
+                <h1 class="text-2xl font-bold text-gray-800 mb-2">Medical Intake Assistant</h1>
+                <p class="text-gray-600">Virtual consultation powered by AI</p>
+            </div>
+            
+            <div class="space-y-6">
+                <!-- Status indicator -->
+                <div id="status" class="text-center text-sm text-gray-500 mb-4">
+                    Ready to start your consultation
+                </div>
+
+                <!-- Start button -->
+                <button 
+                    id="startButton"
+                    class="w-full bg-blue-500 hover:bg-blue-600 text-white font-semibold py-3 px-6 rounded-lg transition duration-200 ease-in-out transform hover:scale-105"
+                    onclick="startConsultation()"
+                >
+                    Start Consultation
+                </button>
+
+                <!-- Instructions -->
+                <div class="mt-6 text-sm text-gray-600">
+                    <h2 class="font-semibold mb-2">Before you begin:</h2>
+                    <ul class="list-disc list-inside space-y-1">
+                        <li>Ensure your camera and microphone are working</li>
+                        <li>Find a quiet place for the consultation</li>
+                        <li>Have your prescription information ready</li>
+                        <li>Allow browser permissions when prompted</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="text-center mt-4 text-sm text-gray-500">
+            Powered by Tri-County Health Services
+        </div>
+    </div>
+
+    <script>
+        let consultationWindow = null;
+
+        async function startConsultation() {
+            const button = document.getElementById('startButton');
+            const status = document.getElementById('status');
+
+            try {
+                // Disable button and show loading state
+                button.disabled = true;
+                button.textContent = 'Connecting...';
+                button.classList.add('opacity-50');
+                status.textContent = 'Generating new consultation room...';
+
+                // Make API call to get new room URL
+                const response = await fetch('/api/get-room-url');
+                if (!response.ok) {
+                    throw new Error('Failed to get room URL');
+                }
+                const data = await response.json();
+
+                if (data.url) {
+                    status.textContent = 'Opening consultation room...';
+                    
+                    // Open new window and store reference
+                    consultationWindow = window.open(data.url, '_blank');
+                    
+                    // Check if window was blocked by popup blocker
+                    if (consultationWindow === null) {
+                        status.textContent = 'Please allow popups and try again';
+                    } else {
+                        status.textContent = 'Consultation room opened in new tab';
+                    }
+                } else {
+                    throw new Error('No URL received');
+                }
+
+            } catch (error) {
+                console.error('Error:', error);
+                status.textContent = 'Error: ' + error.message + '. Please try again.';
+            } finally {
+                // Reset button after short delay
+                setTimeout(() => {
+                    button.disabled = false;
+                    button.textContent = 'Start Consultation';
+                    button.classList.remove('opacity-50');
+                }, 2000);
+            }
+        }
+    </script>
+</body>
+</html>
