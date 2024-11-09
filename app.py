@@ -1,39 +1,33 @@
 import os
 import asyncio
-import aiohttp
 from flask import Flask, send_file, jsonify
-from dotenv import load_dotenv
-from pipecat.services.tavus import TavusVideoService
 from loguru import logger
 import sys
-
-# Load environment variables
-load_dotenv(override=True)
+import threading
+from bot import main as bot_main
+import queue
 
 # Configure logger
 logger.remove(0)
 logger.add(sys.stderr, level="DEBUG")
 
 app = Flask(__name__)
+url_queue = queue.Queue()
 
-async def generate_room_url():
-    """Generate a new room URL using Tavus"""
-    async with aiohttp.ClientSession() as session:
-        tavus = TavusVideoService(
-            api_key=os.getenv("TAVUS_API_KEY"),
-            replica_id=os.getenv("TAVUS_REPLICA_ID"),
-            persona_id=os.getenv("TAVUS_PERSONA_ID", "pipecat0"),
-            session=session,
-        )
-        
-        # Initialize and get room URL
-        room_url = await tavus.initialize()
-        logger.info(f"Generated room URL: {room_url}")
-        return room_url
+def run_bot():
+    """Run the bot and capture room URL from logs"""
+    def log_interceptor(message):
+        """Intercept logger messages to capture room URL"""
+        if "Join the video call at:" in message:
+            url = message.split("Join the video call at:")[-1].strip()
+            url_queue.put(url)
+        logger.info(message)
 
-def sync_generate_room_url():
-    """Synchronous wrapper for generate_room_url"""
-    return asyncio.run(generate_room_url())
+    # Add our interceptor to logger
+    logger.add(log_interceptor)
+    
+    # Run the bot
+    asyncio.run(bot_main())
 
 @app.route('/')
 def index():
@@ -42,13 +36,23 @@ def index():
 
 @app.route('/api/get-room-url')
 def get_room_url():
-    """Generate and return a new room URL"""
+    """Start bot and get room URL from logs"""
     try:
-        room_url = sync_generate_room_url()
-        return jsonify({"url": room_url})
+        # Start bot in a separate thread
+        bot_thread = threading.Thread(target=run_bot)
+        bot_thread.daemon = True
+        bot_thread.start()
+        
+        # Wait for URL from logger
+        try:
+            room_url = url_queue.get(timeout=10)  # 10 second timeout
+            return jsonify({"url": room_url})
+        except queue.Empty:
+            raise TimeoutError("Timeout waiting for room URL")
+            
     except Exception as e:
-        logger.error(f"Error generating room URL: {e}")
-        return jsonify({"error": "Failed to generate room URL"}), 500
+        logger.error(f"Error starting bot: {e}")
+        return jsonify({"error": "Failed to start bot"}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
