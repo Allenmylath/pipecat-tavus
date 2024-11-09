@@ -41,8 +41,8 @@ class LogInterceptor:
         except Exception as e:
             logger.error(f"Error in log interceptor: {e}")
 
-async def run_bot_async():
-    """Asynchronous bot runner"""
+def run_bot(room_url=None, token=None):
+    """Run the bot in a separate process using shell=True"""
     try:
         interceptor = LogInterceptor(url_queue)
         log_id = logger.add(
@@ -53,36 +53,32 @@ async def run_bot_async():
         )
         
         try:
-            # Create subprocess
-            proc = await asyncio.create_subprocess_exec(
-                "python3",
-                "-m",
-                "bot",
+            cmd = "python3 -m bot"
+            if room_url:
+                cmd += f" -u {room_url}"
+            if token:
+                cmd += f" -t {token}"
+                
+            # Use the working subprocess configuration
+            proc = subprocess.Popen(
+                [cmd],
+                shell=True,
+                bufsize=1,
                 cwd=os.path.dirname(os.path.abspath(__file__)),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
             )
             
             # Store the process
             bot_procs[proc.pid] = proc
             
-            # Set a shorter timeout for initial URL generation
-            url_future = asyncio.get_event_loop().run_in_executor(
-                None, 
-                url_queue.get, 
-                True,  # block
-                15     # timeout seconds
-            )
-            
+            # Wait for URL or timeout
             try:
-                url = await url_future
-                return url, proc.pid
-            except (asyncio.TimeoutError, queue.Empty):
-                logger.error("Timeout waiting for room URL")
-                if proc.pid in bot_procs:
-                    await cleanup_process(proc.pid)
-                raise TimeoutError("Bot failed to generate room URL in time")
-                
+                proc_url = url_queue.get(timeout=15)
+                if proc_url:
+                    return proc_url, proc.pid
+            except queue.Empty:
+                proc.terminate()
+                raise TimeoutError("Timeout waiting for room URL")
+            
         finally:
             logger.remove(log_id)
             
@@ -96,9 +92,12 @@ async def cleanup_process(pid: int):
     if proc:
         try:
             proc.terminate()
-            await proc.wait()
-        except Exception as e:
-            logger.error(f"Error cleaning up process {pid}: {e}")
+            proc.wait(timeout=5)
+        except:
+            try:
+                proc.kill()
+            except:
+                pass
 
 async def cleanup():
     """Cleanup all bot processes"""
@@ -131,15 +130,15 @@ async def index():
         raise HTTPException(status_code=500, detail="Failed to load page")
 
 @app.get("/api/get-room-url")
-async def get_room_url(background_tasks: BackgroundTasks):
+async def get_room_url(background_tasks: BackgroundTasks, room_url: str = None, token: str = None):
     """Start bot and get room URL from Tavus"""
     try:
         # Clear queue
         while not url_queue.empty():
             url_queue.get_nowait()
         
-        # Run bot asynchronously
-        url, pid = await run_bot_async()
+        # Run bot using the working configuration
+        url, pid = run_bot(room_url, token)
         
         if url and pid:
             # Add cleanup task to run after response is sent
@@ -169,7 +168,7 @@ async def get_status(pid: int):
             raise HTTPException(status_code=404, detail="Bot not found")
         
         # Check if process is still running
-        if proc.returncode is None:
+        if proc.poll() is None:
             status = "running"
         else:
             status = "finished"
