@@ -378,7 +378,7 @@ async def main():
             transport: DailyTransport, participant: Mapping[str, Any]
         ) -> None:
             if participant.get("info", {}).get("userName", "") != persona_name:
-                await task.queue_frames([EndFrame()]))
+                await task.queue_frames([EndFrame()])
 
         runner = PipelineRunner()
         await runner.run(task)
