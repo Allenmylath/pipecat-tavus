@@ -1,5 +1,5 @@
 python-dotenv
-pipecat-ai[cartesia,openai,silero,deepgram,daily]
+pipecat-ai[cartesia,openai,silero,deepgram,daily,fastapi]
 firebase-admin
 loguru
 flask
