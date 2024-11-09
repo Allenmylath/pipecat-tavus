@@ -5,6 +5,7 @@ import sys
 from loguru import logger
 import json
 from dotenv import load_dotenv
+from typing import Any, Mapping
 import firebase_admin
 from firebase_admin import credentials, firestore
 
