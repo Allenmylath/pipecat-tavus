@@ -1,6 +1,7 @@
 import os
 import asyncio
 import subprocess
+import time
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
@@ -10,19 +11,24 @@ import threading
 import queue
 from contextlib import asynccontextmanager
 import uvicorn
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv(override=True)
 
 # Configure logger
 logger.remove()
 logger.add(
     sys.stdout,
     level="DEBUG",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
     enqueue=True,
     catch=True
 )
 
-# Thread-safe queue for URL sharing
+# Queue for room URLs
 url_queue = queue.Queue()
-# Track active bot processes
+# Track bot processes
 bot_procs = {}
 
 class LogInterceptor:
@@ -34,70 +40,132 @@ class LogInterceptor:
         try:
             with self._lock:
                 if isinstance(message, str):
-                    if "TavusVideoService joined" in message:
-                        url = message.split("TavusVideoService joined")[-1].strip()
+                    logger.debug(f"Bot output: {message}")
+                    if "Join the video call at:" in message:
+                        url = message.split("Join the video call at:")[-1].strip()
+                        logger.info(f"Found room URL: {url}")
                         self.url_queue.put(url)
-                    print(message)
         except Exception as e:
             logger.error(f"Error in log interceptor: {e}")
 
 def run_bot(room_url=None, token=None):
-    """Run the bot in a separate process using shell=True"""
+    """Run the medical intake bot"""
+    proc = None
     try:
-        interceptor = LogInterceptor(url_queue)
-        log_id = logger.add(
-            interceptor,
-            level="DEBUG",
-            enqueue=True,
-            catch=True
+        logger.info("Starting medical intake bot...")
+        
+        # Verify required environment variables
+        required_vars = [
+            "TAVUS_API_KEY",
+            "TAVUS_REPLICA_ID",
+            "OPENAI_API_KEY",
+            "DEEPGRAM_API_KEY",
+            "CARTESIA_API_KEY",
+            "FIREBASE_CREDENTIALS"
+        ]
+        
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if missing_vars:
+            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+        
+        # Construct the bot command
+        cmd = f"{sys.executable} -m bot"
+        if room_url:
+            cmd += f" -u {room_url}"
+        if token:
+            cmd += f" -t {token}"
+            
+        logger.debug(f"Running command: {cmd}")
+        
+        # Start the bot process
+        proc = subprocess.Popen(
+            [cmd],
+            shell=True,
+            bufsize=1,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            env=os.environ.copy()  # Pass current environment variables
         )
         
-        try:
-            cmd = "python3 -m bot"
-            if room_url:
-                cmd += f" -u {room_url}"
-            if token:
-                cmd += f" -t {token}"
-                
-            # Use the working subprocess configuration
-            proc = subprocess.Popen(
-                [cmd],
-                shell=True,
-                bufsize=1,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-            )
-            
-            # Store the process
-            bot_procs[proc.pid] = proc
-            
-            # Wait for URL or timeout
+        logger.info(f"Bot process started with PID: {proc.pid}")
+        bot_procs[proc.pid] = proc
+        
+        # Start output reading threads
+        def read_output(pipe, prefix):
             try:
-                proc_url = url_queue.get(timeout=15)
-                if proc_url:
-                    return proc_url, proc.pid
+                for line in pipe:
+                    clean_line = line.strip()
+                    logger.debug(f"{prefix}: {clean_line}")
+                    
+                    # Look for room URL in the output
+                    if "Join the video call at:" in clean_line:
+                        url = clean_line.split("Join the video call at:")[-1].strip()
+                        logger.info(f"Found room URL: {url}")
+                        url_queue.put(url)
+            except Exception as e:
+                logger.error(f"Error reading {prefix}: {e}")
+        
+        threading.Thread(target=read_output, args=(proc.stdout, "STDOUT"), daemon=True).start()
+        threading.Thread(target=read_output, args=(proc.stderr, "STDERR"), daemon=True).start()
+        
+        # Wait for URL with periodic checks
+        start_time = time.time()
+        timeout = 25  # Increased timeout since this bot needs more startup time
+        check_interval = 0.5
+        
+        while time.time() - start_time < timeout:
+            # Check if process is still running
+            if proc.poll() is not None:
+                returncode = proc.poll()
+                logger.error(f"Bot process exited with code: {returncode}")
+                # Get any remaining output
+                stdout, stderr = proc.communicate()
+                logger.error(f"Final stdout: {stdout}")
+                logger.error(f"Final stderr: {stderr}")
+                raise RuntimeError(f"Bot process exited unexpectedly with code {returncode}")
+            
+            # Try to get URL
+            try:
+                url = url_queue.get_nowait()
+                logger.info(f"Successfully got room URL: {url}")
+                return url, proc.pid
             except queue.Empty:
-                proc.terminate()
-                raise TimeoutError("Timeout waiting for room URL")
-            
-        finally:
-            logger.remove(log_id)
-            
+                time.sleep(check_interval)
+                continue
+        
+        # Timeout reached
+        logger.error("Timeout reached waiting for room URL")
+        proc.terminate()
+        raise TimeoutError("Timeout waiting for room URL")
+        
     except Exception as e:
         logger.error(f"Bot error: {e}")
+        if proc and proc.poll() is None:
+            proc.terminate()
         return None, None
 
 async def cleanup_process(pid: int):
     """Clean up a specific bot process"""
     proc = bot_procs.pop(pid, None)
     if proc:
+        logger.info(f"Cleaning up process {pid}")
         try:
             proc.terminate()
-            proc.wait(timeout=5)
-        except:
             try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Process {pid} did not terminate, forcing kill")
                 proc.kill()
-            except:
-                pass
+                proc.wait()
+        except Exception as e:
+            logger.error(f"Error cleaning up process {pid}: {e}")
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
 
 async def cleanup():
     """Cleanup all bot processes"""
@@ -123,6 +191,7 @@ app.add_middleware(
 
 @app.get("/")
 async def index():
+    """Serve the main index.html page"""
     try:
         return FileResponse('index.html')
     except Exception as e:
@@ -137,11 +206,11 @@ async def get_room_url(background_tasks: BackgroundTasks, room_url: str = None, 
         while not url_queue.empty():
             url_queue.get_nowait()
         
-        # Run bot using the working configuration
+        logger.info("Starting bot process for room URL generation")
         url, pid = run_bot(room_url, token)
         
         if url and pid:
-            # Add cleanup task to run after response is sent
+            logger.info(f"Successfully generated room URL with bot PID: {pid}")
             background_tasks.add_task(cleanup_process, pid)
             return JSONResponse({
                 "url": url,
@@ -149,19 +218,22 @@ async def get_room_url(background_tasks: BackgroundTasks, room_url: str = None, 
                 "status": "success"
             })
         else:
+            logger.error("Failed to generate room URL")
             raise HTTPException(
                 status_code=500, 
                 detail="Failed to generate room URL"
             )
             
     except TimeoutError as e:
+        logger.error(f"Timeout error: {e}")
         raise HTTPException(status_code=504, detail=str(e))
     except Exception as e:
-        logger.error(f"Error starting bot: {e}")
+        logger.error(f"Error in get_room_url: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/status/{pid}")
 async def get_status(pid: int):
+    """Get the status of a specific bot process"""
     try:
         proc = bot_procs.get(pid)
         if not proc:
@@ -188,12 +260,13 @@ async def get_status(pid: int):
 
 @app.get("/health")
 async def health():
+    """Health check endpoint"""
     return JSONResponse({"status": "healthy"})
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Tavus-Pipecat FastAPI server")
+    parser = argparse.ArgumentParser(description="Medical Intake Bot FastAPI server")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", 5000)))
     parser.add_argument("--reload", action="store_true")
