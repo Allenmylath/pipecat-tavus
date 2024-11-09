@@ -17,6 +17,7 @@ from pipecat.services.openai import OpenAILLMContext, OpenAILLMService, OpenAILL
 from pipecat.services.tavus import TavusVideoService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import StartFrame, EndFrame
 
 load_dotenv(override=True)
 
