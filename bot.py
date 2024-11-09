@@ -386,6 +386,6 @@ async def main():
 
         runner = PipelineRunner()
         await runner.run(task)
+        return room_url
 
-if __name__ == "__main__":
-    asyncio.run(main())
+
