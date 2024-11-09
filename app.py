@@ -1,27 +1,33 @@
 import os
 import asyncio
-from flask import Flask, send_file, jsonify
+import subprocess
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from loguru import logger
 import sys
 import threading
 import queue
+from contextlib import asynccontextmanager
 from bot import main as bot_main
-import signal
-import functools
+import uvicorn
 
-# Thread-safe queue for URL sharing
-url_queue = queue.Queue()
-
-# Global logger configuration
-logger.remove()  # Remove default handler
+# Configure logger
+logger.remove()
 logger.add(
     sys.stdout,
     level="DEBUG",
-    enqueue=True,  # Enable async logging
-    catch=True     # Prevent errors from propagating
+    enqueue=True,
+    catch=True
 )
 
+# Thread-safe queue for URL sharing
+url_queue = queue.Queue()
+# Track active bot processes
+bot_procs = {}
+
 class LogInterceptor:
+    """Custom log interceptor to capture the Daily room URL from Tavus"""
     def __init__(self, url_queue):
         self.url_queue = url_queue
         self._lock = threading.Lock()
@@ -29,61 +35,17 @@ class LogInterceptor:
     def __call__(self, message):
         try:
             with self._lock:
-                if isinstance(message, str) and "Join the video call at:" in message:
-                    url = message.split("Join the video call at:")[-1].strip()
-                    self.url_queue.put(url)
-                print(message)  # Using print instead of logger
+                if isinstance(message, str):
+                    # Capture the Daily URL from Tavus service logs
+                    if "TavusVideoService joined" in message:
+                        url = message.split("TavusVideoService joined")[-1].strip()
+                        self.url_queue.put(url)
+                    print(message)
         except Exception as e:
             print(f"Error in log interceptor: {e}")
 
-# Initialize Flask
-app = Flask(__name__)
-
-def run_in_main_thread(f):
-    """Decorator to ensure a function runs in the main thread"""
-    @functools.wraps(f)
-    def wrapper(*args, **kwargs):
-        if not isinstance(threading.current_thread(), threading._MainThread):
-            # If we're not in the main thread, use a queue to run in main thread
-            result_queue = queue.Queue()
-            def main_thread_func():
-                try:
-                    result = f(*args, **kwargs)
-                    result_queue.put(('result', result))
-                except Exception as e:
-                    result_queue.put(('error', e))
-            
-            # Schedule execution in main thread
-            app.config['main_queue'].put(main_thread_func)
-            
-            # Wait for result
-            result_type, result = result_queue.get()
-            if result_type == 'error':
-                raise result
-            return result
-        return f(*args, **kwargs)
-    return wrapper
-
-def process_main_queue():
-    """Process functions queued for main thread execution"""
-    try:
-        while True:
-            try:
-                # Non-blocking get
-                func = app.config['main_queue'].get_nowait()
-                func()
-            except queue.Empty:
-                break
-    except Exception as e:
-        logger.error(f"Error processing main queue: {e}")
-
-@run_in_main_thread
-def run_async_bot():
-    """Run the bot in the main thread"""
-    asyncio.run(bot_main())
-
 def run_bot():
-    """Run the bot and capture room URL from logs"""
+    """Run the bot in a separate process"""
     try:
         # Create a thread-specific interceptor
         interceptor = LogInterceptor(url_queue)
@@ -95,69 +57,142 @@ def run_bot():
         )
         
         try:
-            # Run the bot in the main thread
-            run_async_bot()
-        finally:
+            # Run the bot as a subprocess to avoid signal handling issues
+            proc = subprocess.Popen(
+                ["python3", "-m", "bot"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                bufsize=1,
+                text=True
+            )
+            
+            # Store the process
+            bot_procs[proc.pid] = proc
+            
+            # Wait for URL or timeout
             try:
-                logger.remove(log_id)
-            except:
-                pass
-                
+                proc_url = url_queue.get(timeout=30)
+                if proc_url:
+                    return proc_url, proc.pid
+            except queue.Empty:
+                proc.terminate()
+                raise TimeoutError("Timeout waiting for room URL")
+            
+        finally:
+            logger.remove(log_id)
+            
     except Exception as e:
-        print(f"Bot error: {e}")
-        url_queue.put(None)  # Signal error
+        logger.error(f"Bot error: {e}")
+        return None, None
 
-@app.route('/')
-def index():
+async def cleanup():
+    """Cleanup function for terminating any running bots"""
+    for proc in bot_procs.values():
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except:
+            pass
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting up FastAPI application")
+    yield
+    # Shutdown
+    logger.info("Shutting down FastAPI application")
+    await cleanup()
+
+# Initialize FastAPI with lifespan
+app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+async def index():
     """Serve the main index.html page"""
     try:
-        # Process any pending main thread tasks
-        process_main_queue()
-        return send_file('index.html')
+        return FileResponse('index.html')
     except Exception as e:
-        return jsonify({"error": "Failed to load page"}), 500
+        logger.error(f"Error serving index.html: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load page")
 
-@app.route('/api/get-room-url')
-def get_room_url():
-    """Start bot and get room URL from logs"""
+@app.get("/api/get-room-url")
+async def get_room_url():
+    """Start bot and get room URL from Tavus"""
     try:
-        # Clear the queue before starting new bot
+        # Clear any existing URLs from the queue
         while not url_queue.empty():
             url_queue.get_nowait()
-            
-        # Process any pending main thread tasks
-        process_main_queue()
-            
-        # Start bot in a separate thread
-        bot_thread = threading.Thread(target=run_bot)
-        bot_thread.daemon = True
-        bot_thread.start()
         
-        # Wait for URL from logger
-        try:
-            room_url = url_queue.get(timeout=30)
-            if room_url is None:
-                raise Exception("Bot failed to generate URL")
-            return jsonify({"url": room_url})
-        except queue.Empty:
-            raise TimeoutError("Timeout waiting for room URL")
+        # Start the bot and get the URL
+        url, pid = run_bot()
+        
+        if url and pid:
+            return JSONResponse({
+                "url": url,
+                "bot_pid": pid
+            })
+        else:
+            raise HTTPException(status_code=500, detail="Failed to generate room URL")
             
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error starting bot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy"})
+@app.get("/api/status/{pid}")
+async def get_status(pid: int):
+    """Get the status of a specific bot process"""
+    try:
+        proc = bot_procs.get(pid)
+        if not proc:
+            raise HTTPException(status_code=404, detail="Bot not found")
+        
+        # Check process status
+        if proc.poll() is None:
+            status = "running"
+        else:
+            status = "finished"
+            # Clean up finished process
+            bot_procs.pop(pid, None)
+            
+        return JSONResponse({
+            "bot_pid": pid,
+            "status": status
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error checking bot status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-def init_app():
-    """Initialize the application"""
-    # Create queue for main thread execution
-    app.config['main_queue'] = queue.Queue()
-    
-    # Disable signal handling in sub-threads
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return JSONResponse({"status": "healthy"})
 
 if __name__ == "__main__":
-    init_app()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Tavus-Pipecat FastAPI server")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", 5000)), help="Port number")
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
+    
+    args = parser.parse_args()
+    
+    logger.info(f"Starting server at http://{args.host}:{args.port}")
+    
+    uvicorn.run(
+        "app:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload
+    )
