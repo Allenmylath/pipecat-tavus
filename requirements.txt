@@ -1,6 +1,7 @@
 python-dotenv
-pipecat-ai[cartesia,openai,silero,deepgram,daily,fastapi]
+pipecat-ai[cartesia,openai,silero,deepgram,daily]
 firebase-admin
 loguru
 flask
+fastapi[all]
 gunicorn
