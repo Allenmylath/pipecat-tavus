@@ -14,7 +14,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.openai import OpenAILLMContext, OpenAILLMService, OpenAILLMContextFrame
-from pipecat.services.tavus import TavusVideoService
+from tavus import TavusVideoService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import StartFrame, EndFrame
