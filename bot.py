@@ -371,6 +371,8 @@ async def main():
                 # Clear existing messages and create new context
                 context.messages.clear()
                 intake = IntakeProcessor(context)
+                # Reset context aggregator with fresh context
+                context_aggregator = llm.create_context_aggregator(context)
                 # Kick off the conversation
                 await task.queue_frames([OpenAILLMContextFrame(context)])
 
