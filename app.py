@@ -1,15 +1,14 @@
 import os
 import asyncio
 import subprocess
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
+from fastapi.responses import JSONResponse, FileResponse
 from loguru import logger
 import sys
 import threading
 import queue
 from contextlib import asynccontextmanager
-from bot import main as bot_main
 import uvicorn
 
 # Configure logger
@@ -27,7 +26,6 @@ url_queue = queue.Queue()
 bot_procs = {}
 
 class LogInterceptor:
-    """Custom log interceptor to capture the Daily room URL from Tavus"""
     def __init__(self, url_queue):
         self.url_queue = url_queue
         self._lock = threading.Lock()
@@ -36,18 +34,16 @@ class LogInterceptor:
         try:
             with self._lock:
                 if isinstance(message, str):
-                    # Capture the Daily URL from Tavus service logs
                     if "TavusVideoService joined" in message:
                         url = message.split("TavusVideoService joined")[-1].strip()
                         self.url_queue.put(url)
                     print(message)
         except Exception as e:
-            print(f"Error in log interceptor: {e}")
+            logger.error(f"Error in log interceptor: {e}")
 
-def run_bot():
-    """Run the bot in a separate process"""
+async def run_bot_async():
+    """Asynchronous bot runner"""
     try:
-        # Create a thread-specific interceptor
         interceptor = LogInterceptor(url_queue)
         log_id = logger.add(
             interceptor,
@@ -57,26 +53,36 @@ def run_bot():
         )
         
         try:
-            # Run the bot as a subprocess to avoid signal handling issues
-            proc = subprocess.Popen(
-                ["python3", "-m", "bot"],
+            # Create subprocess
+            proc = await asyncio.create_subprocess_exec(
+                "python3",
+                "-m",
+                "bot",
                 cwd=os.path.dirname(os.path.abspath(__file__)),
-                bufsize=1,
-                text=True
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
             )
             
             # Store the process
             bot_procs[proc.pid] = proc
             
-            # Wait for URL or timeout
-            try:
-                proc_url = url_queue.get(timeout=30)
-                if proc_url:
-                    return proc_url, proc.pid
-            except queue.Empty:
-                proc.terminate()
-                raise TimeoutError("Timeout waiting for room URL")
+            # Set a shorter timeout for initial URL generation
+            url_future = asyncio.get_event_loop().run_in_executor(
+                None, 
+                url_queue.get, 
+                True,  # block
+                15     # timeout seconds
+            )
             
+            try:
+                url = await url_future
+                return url, proc.pid
+            except (asyncio.TimeoutError, queue.Empty):
+                logger.error("Timeout waiting for room URL")
+                if proc.pid in bot_procs:
+                    await cleanup_process(proc.pid)
+                raise TimeoutError("Bot failed to generate room URL in time")
+                
         finally:
             logger.remove(log_id)
             
@@ -84,28 +90,30 @@ def run_bot():
         logger.error(f"Bot error: {e}")
         return None, None
 
-async def cleanup():
-    """Cleanup function for terminating any running bots"""
-    for proc in bot_procs.values():
+async def cleanup_process(pid: int):
+    """Clean up a specific bot process"""
+    proc = bot_procs.pop(pid, None)
+    if proc:
         try:
             proc.terminate()
-            proc.wait(timeout=5)
-        except:
-            pass
+            await proc.wait()
+        except Exception as e:
+            logger.error(f"Error cleaning up process {pid}: {e}")
+
+async def cleanup():
+    """Cleanup all bot processes"""
+    for pid in list(bot_procs.keys()):
+        await cleanup_process(pid)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     logger.info("Starting up FastAPI application")
     yield
-    # Shutdown
     logger.info("Shutting down FastAPI application")
     await cleanup()
 
-# Initialize FastAPI with lifespan
 app = FastAPI(lifespan=lifespan)
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -116,7 +124,6 @@ app.add_middleware(
 
 @app.get("/")
 async def index():
-    """Serve the main index.html page"""
     try:
         return FileResponse('index.html')
     except Exception as e:
@@ -124,43 +131,50 @@ async def index():
         raise HTTPException(status_code=500, detail="Failed to load page")
 
 @app.get("/api/get-room-url")
-async def get_room_url():
+async def get_room_url(background_tasks: BackgroundTasks):
     """Start bot and get room URL from Tavus"""
     try:
-        # Clear any existing URLs from the queue
+        # Clear queue
         while not url_queue.empty():
             url_queue.get_nowait()
         
-        # Start the bot and get the URL
-        url, pid = run_bot()
+        # Run bot asynchronously
+        url, pid = await run_bot_async()
         
         if url and pid:
+            # Add cleanup task to run after response is sent
+            background_tasks.add_task(cleanup_process, pid)
             return JSONResponse({
                 "url": url,
-                "bot_pid": pid
+                "bot_pid": pid,
+                "status": "success"
             })
         else:
-            raise HTTPException(status_code=500, detail="Failed to generate room URL")
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to generate room URL"
+            )
             
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e))
     except Exception as e:
         logger.error(f"Error starting bot: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/status/{pid}")
 async def get_status(pid: int):
-    """Get the status of a specific bot process"""
     try:
         proc = bot_procs.get(pid)
         if not proc:
             raise HTTPException(status_code=404, detail="Bot not found")
         
-        # Check process status
-        if proc.poll() is None:
+        # Check if process is still running
+        if proc.returncode is None:
             status = "running"
         else:
             status = "finished"
             # Clean up finished process
-            bot_procs.pop(pid, None)
+            await cleanup_process(pid)
             
         return JSONResponse({
             "bot_pid": pid,
@@ -175,16 +189,15 @@ async def get_status(pid: int):
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
     return JSONResponse({"status": "healthy"})
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Tavus-Pipecat FastAPI server")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address")
-    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", 5000)), help="Port number")
-    parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", 5000)))
+    parser.add_argument("--reload", action="store_true")
     
     args = parser.parse_args()
     
