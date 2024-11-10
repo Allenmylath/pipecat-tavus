@@ -13,6 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from loguru import logger
 import sys
+import threading
+from queue import Queue
+import asyncio
 from tavus import TavusVideoService
 
 MAX_BOTS_PER_ROOM = 1
@@ -21,23 +24,17 @@ MAX_BOTS_PER_ROOM = 1
 bot_procs = {}
 tavus_session = None
 
+# Configure logging
 logger.remove()
-logger.add(sys.stderr, level="DEBUG")
+logger.add(sys.stdout, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level}</level> | <cyan>SERVER</cyan>: {message}")
 
-class CustomTavusVideoService(TavusVideoService):
-    """Extended TavusVideoService with extra logging"""
-    
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        if isinstance(frame, TTSAudioRawFrame):
-            logger.info(f"Sending audio frame to Tavus: {len(frame.audio)} bytes, sample rate: {frame.sample_rate}")
-        elif isinstance(frame, TTSStartedFrame):
-            logger.info(f"TTS Started, frame ID: {frame.id}")
-        elif isinstance(frame, TTSStoppedFrame):
-            logger.info("TTS Stopped")
-        await super().process_frame(frame, direction)
+def log_stream(stream, prefix):
+    """Read and log a stream (stdout/stderr) with a prefix"""
+    for line in iter(stream.readline, ''):
+        if line:
+            logger.info(f"{prefix}: {line.strip()}")
 
 def cleanup():
-    # Clean up function, just to be extra safe
     for entry in bot_procs.values():
         proc = entry[0]
         try:
@@ -68,23 +65,71 @@ app.add_middleware(
 async def get_tavus_room():
     """Initialize Tavus and get room URL"""
     try:
-        tavus = CustomTavusVideoService(
+        tavus = TavusVideoService(
             api_key=os.getenv("TAVUS_API_KEY"),
             replica_id=os.getenv("TAVUS_REPLICA_ID"),
             persona_id=os.getenv("TAVUS_PERSONA_ID", "p2fbd605"),
             session=tavus_session,
         )
         
-        # Get persona name and room URL
         persona_name = await tavus.get_persona_name()
         room_url = await tavus.initialize()
         logger.info(f"Got room URL from Tavus: {room_url}")
         logger.info(f"Persona name: {persona_name}")
-        logger.info(f"Conversation ID: {tavus._conversation_id}")
         
         return room_url, persona_name
     except Exception as e:
         logger.error(f"Error getting Tavus room: {e}")
+        raise
+
+async def run_bot_process(room_url):
+    """Run bot process and capture output"""
+    try:
+        # Set up environment with debug logging
+        env = os.environ.copy()
+        env['LOGURU_LEVEL'] = 'DEBUG'
+        env['PYTHONUNBUFFERED'] = '1'  # Force unbuffered output
+
+        # Prepare command
+        cmd = [
+            sys.executable,  # Use same Python interpreter
+            "-u",  # Unbuffered output
+            "-m", "bot",
+            "-u", room_url,
+        ]
+
+        logger.info(f"Starting bot with command: {' '.join(cmd)}")
+
+        # Start process with pipe for output
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,  # Return strings instead of bytes
+            bufsize=1,  # Line buffered
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            env=env
+        )
+
+        # Start threads to monitor output
+        stdout_thread = threading.Thread(
+            target=log_stream, 
+            args=(process.stdout, "BOT-OUT"),
+            daemon=True
+        )
+        stderr_thread = threading.Thread(
+            target=log_stream, 
+            args=(process.stderr, "BOT-ERR"),
+            daemon=True
+        )
+
+        stdout_thread.start()
+        stderr_thread.start()
+
+        return process
+
+    except Exception as e:
+        logger.error(f"Error starting bot process: {e}")
         raise
 
 @app.get("/")
@@ -92,7 +137,6 @@ async def start_agent(request: Request):
     logger.info("Starting agent initialization")
     
     try:
-        # Get room URL from Tavus
         room_url, persona_name = await get_tavus_room()
         
         if not room_url:
@@ -101,57 +145,21 @@ async def start_agent(request: Request):
                 detail="Failed to get room URL from Tavus"
             )
 
-        # Check existing processes
+        # Check for existing bots
         num_bots_in_room = sum(
             1 for proc in bot_procs.values() if proc[1] == room_url and proc[0].poll() is None
         )
         if num_bots_in_room >= MAX_BOTS_PER_ROOM:
             raise HTTPException(status_code=500, detail=f"Max bot limit reached for room: {room_url}")
 
-        # Start the bot process with room URL and detailed logging
-        try:
-            env = os.environ.copy()
-            env['LOGURU_LEVEL'] = 'DEBUG'
-            
-            cmd = [
-                "python3", "-m", "bot",
-                "-u", room_url,
-                "--debug"  # Add debug flag if your bot supports it
-            ]
-            
-            proc = subprocess.Popen(
-                cmd,
-                bufsize=1,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-            
-            bot_procs[proc.pid] = (proc, room_url)
-            logger.info(f"Started bot process {proc.pid} for room {room_url}")
-            
-            # Start a thread to monitor bot output
-            import threading
-            def monitor_output():
-                while True:
-                    output = proc.stdout.readline()
-                    if output:
-                        logger.info(f"Bot output: {output.strip()}")
-                    error = proc.stderr.readline()
-                    if error:
-                        logger.error(f"Bot error: {error.strip()}")
-                    if proc.poll() is not None:
-                        break
-                        
-            threading.Thread(target=monitor_output, daemon=True).start()
-            
-            return RedirectResponse(room_url)
-            
-        except Exception as e:
-            logger.error(f"Failed to start bot process: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to start bot process: {e}")
+        # Start bot process
+        proc = await run_bot_process(room_url)
+        
+        # Store process info
+        bot_procs[proc.pid] = (proc, room_url)
+        logger.info(f"Bot process started with PID {proc.pid}")
+
+        return RedirectResponse(room_url)
 
     except Exception as e:
         logger.error(f"Failed to initialize agent: {e}")
@@ -165,22 +173,18 @@ def get_status(pid: int):
 
     process, room_url = proc
     returncode = process.poll()
-    
-    if returncode is None:
-        status = "running"
-    else:
-        status = f"finished with code {returncode}"
-        # Get any remaining output
-        stdout, stderr = process.communicate()
-        if stderr:
-            logger.error(f"Bot final error output: {stderr}")
-            status += f" (error: {stderr})"
 
-    return JSONResponse({
+    status_info = {
         "bot_id": pid,
-        "status": status,
-        "room_url": room_url
-    })
+        "room_url": room_url,
+    }
+
+    if returncode is None:
+        status_info["status"] = "running"
+    else:
+        status_info["status"] = f"finished (code {returncode})"
+
+    return JSONResponse(status_info)
 
 @app.get("/health")
 async def health_check():
