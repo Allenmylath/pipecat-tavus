@@ -14,17 +14,15 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from loguru import logger
 import sys
 import threading
-from queue import Queue
-import asyncio
 from tavus import TavusVideoService
+from configure import configure
 
-MAX_BOTS_PER_ROOM = 5
+MAX_BOTS_PER_ROOM = 1
 
 # Bot sub-process dict for status reporting and concurrency control
 bot_procs = {}
 tavus_session = None
 
-# Configure logging
 logger.remove()
 logger.add(sys.stdout, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level}</level> | <cyan>SERVER</cyan>: {message}")
 
@@ -77,41 +75,46 @@ async def get_tavus_room():
         logger.info(f"Got room URL from Tavus: {room_url}")
         logger.info(f"Persona name: {persona_name}")
         
-        return room_url, persona_name
+        # Get Daily token for the room
+        room_url, token = await configure(tavus_session)
+        logger.info(f"Got Daily token: {token}")
+        
+        return room_url, token, persona_name
     except Exception as e:
-        logger.error(f"Error getting Tavus room: {e}")
+        logger.error(f"Error getting room configuration: {e}")
         raise
 
-async def run_bot_process(room_url):
-    """Run bot process and capture output"""
+async def run_bot_process(room_url: str, token: str):
+    """Run bot process with room URL and token"""
     try:
         # Set up environment with debug logging
         env = os.environ.copy()
         env['LOGURU_LEVEL'] = 'DEBUG'
-        env['PYTHONUNBUFFERED'] = '1'  # Force unbuffered output
+        env['PYTHONUNBUFFERED'] = '1'
+        env['DAILY_API_KEY'] = os.getenv('DAILY_API_KEY', '')
+        env['DAILY_SAMPLE_ROOM_URL'] = room_url
 
-        # Prepare command
+        # Prepare command with token
         cmd = [
-            sys.executable,  # Use same Python interpreter
-            "-u",  # Unbuffered output
+            sys.executable,
+            "-u",
             "-m", "bot",
             "-u", room_url,
+            "--token", token
         ]
 
         logger.info(f"Starting bot with command: {' '.join(cmd)}")
 
-        # Start process with pipe for output
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,  # Return strings instead of bytes
-            bufsize=1,  # Line buffered
+            text=True,
+            bufsize=1,
             cwd=os.path.dirname(os.path.abspath(__file__)),
             env=env
         )
 
-        # Start threads to monitor output
         stdout_thread = threading.Thread(
             target=log_stream, 
             args=(process.stdout, "BOT-OUT"),
@@ -137,7 +140,7 @@ async def start_agent(request: Request):
     logger.info("Starting agent initialization")
     
     try:
-        room_url, persona_name = await get_tavus_room()
+        room_url, token, persona_name = await get_tavus_room()
         
         if not room_url:
             raise HTTPException(
@@ -152,8 +155,8 @@ async def start_agent(request: Request):
         if num_bots_in_room >= MAX_BOTS_PER_ROOM:
             raise HTTPException(status_code=500, detail=f"Max bot limit reached for room: {room_url}")
 
-        # Start bot process
-        proc = await run_bot_process(room_url)
+        # Start bot process with token
+        proc = await run_bot_process(room_url, token)
         
         # Store process info
         bot_procs[proc.pid] = (proc, room_url)
@@ -194,12 +197,11 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     
-    # Use Heroku's PORT environment variable
     port = int(os.getenv("PORT", 8000))
     
     logger.info(f"Server starting on port {port}")
     uvicorn.run(
-        "app:app",
+        "server:app",
         host="0.0.0.0",
         port=port,
         reload=False if os.getenv("ENVIRONMENT") == "production" else True,
