@@ -18,7 +18,7 @@ from queue import Queue
 import asyncio
 from tavus import TavusVideoService
 
-MAX_BOTS_PER_ROOM = 1
+MAX_BOTS_PER_ROOM = 5
 
 # Bot sub-process dict for status reporting and concurrency control
 bot_procs = {}
