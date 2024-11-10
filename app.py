@@ -7,22 +7,56 @@
 import aiohttp
 import os
 import subprocess
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+import threading
+from queue import Queue
+import sys
+from loguru import logger
 
 MAX_BOTS_PER_ROOM = 1
+WAIT_TIMEOUT = 30  # Maximum seconds to wait for room URL
 
 # Bot sub-process dict for status reporting and concurrency control
 bot_procs = {}
+output_queues = {}
+room_events = {}
+
+logger.remove()
+logger.add(sys.stderr, level="DEBUG")
+
+def read_output(proc, queue, pid):
+    """Read process output in a separate thread"""
+    while True:
+        line = proc.stdout.readline()
+        if not line and proc.poll() is not None:
+            break
+        if line:
+            line = line.strip()
+            logger.debug(f"Bot output: {line}")
+            queue.put(line)
+            # Check for room URL
+            if "Join the video call at:" in line:
+                room_url = line.split("Join the video call at:")[-1].strip()
+                bot_procs[pid] = (proc, room_url)
+                logger.info(f"Found room URL: {room_url}")
+                # Set the event to signal URL is available
+                if pid in room_events:
+                    room_events[pid].set()
 
 def cleanup():
     # Clean up function, just to be extra safe
     for entry in bot_procs.values():
         proc = entry[0]
-        proc.terminate()
-        proc.wait()
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -41,82 +75,68 @@ app.add_middleware(
 
 @app.get("/")
 async def start_agent(request: Request):
-    print(f"!!! Starting bot process")
+    logger.info("Starting bot process")
     
     try:
-        # Start the bot process directly - it will handle room creation via Tavus
+        # Start the bot process with proper output handling
         proc = subprocess.Popen(
             ["python3", "bot.py"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            universal_newlines=True,
+            bufsize=1,  # Line buffered
             cwd=os.path.dirname(os.path.abspath(__file__)),
         )
         
-        # Store process info
-        bot_procs[proc.pid] = (proc, None)  # We don't have the room URL yet
+        pid = proc.pid
         
-        # Return the process ID so the client can check status
-        return JSONResponse({
-            "status": "started",
-            "bot_id": proc.pid,
-            "message": "Bot process started. Check status endpoint for room URL."
-        })
+        # Create output queue and event for this process
+        output_queue = Queue()
+        output_queues[pid] = output_queue
+        room_events[pid] = asyncio.Event()
+        
+        # Start output reader thread
+        thread = threading.Thread(
+            target=read_output,
+            args=(proc, output_queue, pid),
+            daemon=True
+        )
+        thread.start()
+        
+        # Store process info
+        bot_procs[pid] = (proc, None)
+        
+        logger.info(f"Bot process started with PID: {pid}")
+        
+        # Wait for room URL with timeout
+        try:
+            await asyncio.wait_for(room_events[pid].wait(), timeout=WAIT_TIMEOUT)
+            # Get room URL
+            _, room_url = bot_procs[pid]
+            if room_url:
+                logger.info(f"Redirecting to room: {room_url}")
+                return RedirectResponse(url=room_url)
+        except asyncio.TimeoutError:
+            logger.error("Timeout waiting for room URL")
+            raise HTTPException(
+                status_code=500,
+                detail="Timeout waiting for room initialization"
+            )
+        
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to get room URL"
+        )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start bot process: {e}")
-
-@app.get("/status/{pid}")
-def get_status(pid: int):
-    # Look up the subprocess
-    proc_entry = bot_procs.get(pid)
-
-    # If the subprocess doesn't exist, return an error
-    if not proc_entry:
-        raise HTTPException(status_code=404, detail=f"Bot with process id: {pid} not found")
-    
-    proc = proc_entry[0]
-    
-    # Check if process is still running
-    if proc.poll() is None:
-        # Process is running
-        # Check stdout for room URL
-        output, error = "", ""
-        try:
-            output = proc.stdout.readline()
-            if not output:
-                error = proc.stderr.readline()
-        except:
-            pass
-            
-        # Look for room URL in output
-        if "Join the video call at:" in output:
-            room_url = output.split("Join the video call at:")[-1].strip()
-            bot_procs[pid] = (proc, room_url)  # Update with room URL
-            return JSONResponse({
-                "bot_id": pid,
-                "status": "running",
-                "room_url": room_url
-            })
-        
-        return JSONResponse({
-            "bot_id": pid,
-            "status": "initializing",
-            "message": "Bot starting up, room URL not available yet"
-        })
-    else:
-        # Process has ended
-        output, error = proc.communicate()
-        status_info = {
-            "bot_id": pid,
-            "status": "finished",
-            "exit_code": proc.returncode
-        }
-        
-        if error:
-            status_info["error"] = error
-            
-        return JSONResponse(status_info)
+        logger.error(f"Failed to start bot process: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Cleanup events and queues
+        if pid in room_events:
+            del room_events[pid]
+        if pid in output_queues:
+            del output_queues[pid]
 
 @app.get("/health")
 async def health_check():
@@ -129,7 +149,7 @@ if __name__ == "__main__":
     # Use Heroku's PORT environment variable
     port = int(os.getenv("PORT", 8000))
     
-    print(f"Server starting on port {port}")
+    logger.info(f"Server starting on port {port}")
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
