@@ -279,7 +279,8 @@ async def main():
 
         # Get persona name and room URL
         persona_name = await tavus.get_persona_name()
-        room_url = await tavus.initialize()
+        #room_url = await tavus.initialize()
+        room_url = await configure(session)
         logger.info(f"Join the video call at: {room_url}")
 
         # Initialize Daily transport
