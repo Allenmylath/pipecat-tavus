@@ -337,25 +337,30 @@ async def main():
             start_callback=intake.start_visit_reasons
         )
 
-        pipeline = Pipeline([
-            transport.input(),  # Daily WebRTC input
-            stt,  # Speech-To-Text
-            context_aggregator.user(),  # User responses
-            llm,  # LLM
-            tts,  # Text-To-Speech
-            tavus,  # Tavus video layer
-            transport.output(),  # Daily WebRTC output
-            context_aggregator.assistant(),  # Assistant responses
-        ])
+        tma_in = LLMUserResponseAggregator(messages)
+        tma_out = LLMAssistantResponseAggregator(messages)
+
+        pipeline = Pipeline(
+            [
+                transport.input(),  # Transport user input
+                stt,  # STT
+                tma_in,  # User responses
+                llm,  # LLM
+                tts,  # TTS
+                tavus,  # Tavus output layer
+                transport.output(),  # Transport bot output
+                tma_out,  # Assistant spoken responses
+            ]
+        )
 
         task = PipelineTask(
             pipeline,
             PipelineParams(
-                allow_interruptions=False,
+                allow_interruptions=True,
                 enable_metrics=True,
                 enable_usage_metrics=True,
                 report_only_initial_ttfb=True,
-            )
+            ),
         )
 
         @transport.event_handler("on_participant_joined")
