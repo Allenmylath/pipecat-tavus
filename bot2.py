@@ -279,8 +279,8 @@ async def main():
 
         # Get persona name and room URL
         persona_name = await tavus.get_persona_name()
-        #room_url = await tavus.initialize()
-        room_url = await configure(session)
+        room_url = await tavus.initialize()
+        #room_url = await configure(session)
         logger.info(f"Join the video call at: {room_url}")
 
         # Initialize Daily transport
@@ -297,7 +297,7 @@ async def main():
 
         llm = OpenAILLMService(
             api_key=os.getenv("OPENAI_API_KEY"),
-            model="gpt-4o"
+            model="gpt-4o-min1"
         )
         stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
         tts = CartesiaTTSService(
