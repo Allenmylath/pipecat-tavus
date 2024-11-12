@@ -16,10 +16,6 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.openai import OpenAILLMContext, OpenAILLMService, OpenAILLMContextFrame
-from pipecat.processors.aggregators.llm_response import (
-    LLMAssistantResponseAggregator,
-    LLMUserResponseAggregator,
-)
 from tavus import TavusVideoService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -337,30 +333,25 @@ async def main():
             start_callback=intake.start_visit_reasons
         )
 
-        tma_in = LLMUserResponseAggregator(messages)
-        tma_out = LLMAssistantResponseAggregator(messages)
-
-        pipeline = Pipeline(
-            [
-                transport.input(),  # Transport user input
-                stt,  # STT
-                tma_in,  # User responses
-                llm,  # LLM
-                tts,  # TTS
-                tavus,  # Tavus output layer
-                transport.output(),  # Transport bot output
-                tma_out,  # Assistant spoken responses
-            ]
-        )
+        pipeline = Pipeline([
+            transport.input(),  # Daily WebRTC input
+            stt,  # Speech-To-Text
+            context_aggregator.user(),  # User responses
+            llm,  # LLM
+            tts,  # Text-To-Speech
+            tavus,  # Tavus video layer
+            transport.output(),  # Daily WebRTC output
+            context_aggregator.assistant(),  # Assistant responses
+        ])
 
         task = PipelineTask(
             pipeline,
             PipelineParams(
-                allow_interruptions=True,
+                allow_interruptions=False,
                 enable_metrics=True,
                 enable_usage_metrics=True,
                 report_only_initial_ttfb=True,
-            ),
+            )
         )
 
         @transport.event_handler("on_participant_joined")
