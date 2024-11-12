@@ -22,7 +22,7 @@ from pipecat.processors.aggregators.llm_response import (
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.openai import OpenAILLMService
 from pipecat.services.deepgram import DeepgramSTTService
-from pipecat.services.tavus import TavusVideoService
+from tavus import TavusVideoService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 
