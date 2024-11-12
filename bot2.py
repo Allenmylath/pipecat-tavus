@@ -16,6 +16,10 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.openai import OpenAILLMContext, OpenAILLMService, OpenAILLMContextFrame
+from pipecat.processors.aggregators.llm_response import (
+    LLMAssistantResponseAggregator,
+    LLMUserResponseAggregator,
+)
 from tavus import TavusVideoService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from pipecat.audio.vad.silero import SileroVADAnalyzer
