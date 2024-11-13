@@ -1,1 +1,1 @@
-worker: python3 -u -v bot2.py
+worker: python3  bot.py
